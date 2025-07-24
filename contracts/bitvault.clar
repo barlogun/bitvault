@@ -391,3 +391,127 @@
     )
   )
 )
+
+;; LIQUIDATION ENGINE - PROTOCOL SOLVENCY PROTECTION
+
+;; Execute liquidation of undercollateralized position
+(define-public (liquidate-position (target-user principal))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (let (
+      (position (unwrap! (map-get? positions target-user) ERR-POSITION-NOT-FOUND))
+      (liquidator tx-sender)
+    )
+      (begin
+        (asserts! (not (is-eq target-user liquidator)) ERR-NOT-AUTHORIZED)
+        
+        ;; Validate current BTC price feed availability
+        (let ((btc-price (try! (get-current-price))))
+          (begin
+            ;; Execute global interest accrual update
+            (accrue-global-interest)
+            
+            ;; Update target position and verify liquidation eligibility
+            (let (
+              (updated-position (accrue-position-interest target-user))
+              (debt (get debt updated-position))
+              (collateral (get collateral updated-position))
+              (collateral-value-usd (collateral-value collateral btc-price))
+              (liquidation-threshold-value (/ (* debt LIQUIDATION-THRESHOLD) u100))
+            )
+              (begin
+                ;; Verify position qualifies for liquidation
+                (asserts! (< collateral-value-usd liquidation-threshold-value) ERR-NOT-AUTHORIZED)
+                
+                ;; Liquidator covers outstanding debt
+                (try! (ft-burn? bitvault-token debt liquidator))
+                
+                ;; Calculate liquidation rewards and penalties
+                (let (
+                  (liquidation-bonus (/ (* collateral LIQUIDATION-PENALTY) u100))
+                  (liquidator-reward (- collateral liquidation-bonus))
+                )
+                  (begin
+                    ;; Update global protocol accounting
+                    (var-set total-collateral (- (var-get total-collateral) collateral))
+                    (var-set total-debt (- (var-get total-debt) debt))
+                    
+                    ;; Remove liquidated position from registry
+                    (map-delete positions target-user)
+                    
+                    ;; Accumulate liquidation penalty as protocol revenue
+                    (var-set stability-fee (+ (var-get stability-fee) liquidation-bonus))
+                    
+                    (ok true)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; READ-ONLY PROTOCOL QUERY & ANALYTICS FUNCTIONS
+
+;; Retrieve detailed user position information
+(define-read-only (get-user-position (user principal))
+  (map-get? positions user)
+)
+
+;; Calculate current position collateralization ratio
+(define-read-only (get-collateralization-ratio (user principal))
+  (match (map-get? positions user)
+    position (match (var-get btc-price-in-usd)
+      price-data (let (
+        (price (get price price-data))
+        (collateral (get collateral position))
+        (debt (get debt position))
+      )
+        (if (is-eq debt u0)
+          none
+          (some (/ (* (collateral-value collateral price) u100) debt))
+        ))
+      none)
+    none)
+)
+
+;; Retrieve comprehensive protocol health metrics
+(define-read-only (get-protocol-metrics)
+  {
+    total-debt: (var-get total-debt),
+    total-collateral: (var-get total-collateral),
+    stability-fee: (var-get stability-fee),
+    protocol-paused: (var-get protocol-paused),
+    btc-price: (var-get btc-price-in-usd),
+    last-accrual-block: (var-get last-accrual-block)
+  }
+)
+
+;; Check if position is eligible for liquidation
+(define-read-only (is-liquidatable (user principal))
+  (match (map-get? positions user)
+    position (match (var-get btc-price-in-usd)
+      price-data (let (
+        (price (get price price-data))
+        (collateral (get collateral position))
+        (debt (get debt position))
+        (collateral-value-usd (collateral-value collateral price))
+        (liquidation-threshold-value (/ (* debt LIQUIDATION-THRESHOLD) u100))
+      )
+        (< collateral-value-usd liquidation-threshold-value))
+      false)
+    false)
+)
+
+;; PROTOCOL INITIALIZATION & DEPLOYMENT SETUP
+
+;; Initialize protocol with deployer as initial administrator
+(define-private (initialize-protocol)
+  (var-set protocol-owner tx-sender)
+)
+
+;; Execute protocol initialization sequence
+(initialize-protocol)
