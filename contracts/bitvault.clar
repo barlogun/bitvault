@@ -294,3 +294,100 @@
     )
   )
 )
+
+;; Repay BVLT debt to reduce position liability
+(define-public (repay-debt (amount uint))
+  (let (
+    (user tx-sender)
+    (position (unwrap! (map-get? positions user) ERR-POSITION-NOT-FOUND))
+  )
+    (begin
+      (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+      (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+      
+      ;; Execute global interest accrual update
+      (accrue-global-interest)
+      
+      ;; Update position with accumulated interest
+      (let (
+        (updated-position (accrue-position-interest user))
+        (current-debt (get debt updated-position))
+        (collateral (get collateral updated-position))
+        (repay-amount (if (> amount current-debt) current-debt amount))
+        (new-debt (- current-debt repay-amount))
+      )
+        (begin
+          (asserts! (<= repay-amount current-debt) ERR-INSUFFICIENT-DEBT)
+          
+          ;; Burn BVLT tokens from user balance
+          (try! (ft-burn? bitvault-token repay-amount user))
+          
+          ;; Handle complete or partial debt repayment
+          (if (is-eq new-debt u0)
+            ;; Full repayment: close position and return collateral
+            (begin
+              (map-delete positions user)
+              (var-set total-collateral (- (var-get total-collateral) collateral))
+            )
+            ;; Partial repayment: update position with reduced debt
+            (map-set positions user {
+              collateral: collateral,
+              debt: new-debt,
+              last-update-block: stacks-block-height
+            })
+          )
+          
+          ;; Update global debt tracking
+          (var-set total-debt (- (var-get total-debt) repay-amount))
+          
+          (ok true)
+        )
+      )
+    )
+  )
+)
+
+;; Withdraw BTC collateral while maintaining safe collateralization
+(define-public (withdraw-collateral (btc-amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (> btc-amount u0) ERR-INVALID-AMOUNT)
+    
+    ;; Validate current BTC price feed availability
+    (let (
+      (btc-price (try! (get-current-price)))
+      (user tx-sender)
+    )
+      (begin
+        ;; Execute global interest accrual update
+        (accrue-global-interest)
+        
+        ;; Update position with accumulated interest
+        (let (
+          (updated-position (accrue-position-interest user))
+          (current-debt (get debt updated-position))
+          (current-collateral (get collateral updated-position))
+          (new-collateral (- current-collateral btc-amount))
+          (min-required-collateral (required-collateral current-debt btc-price))
+        )
+          (begin
+            (asserts! (<= btc-amount current-collateral) ERR-INSUFFICIENT-COLLATERAL)
+            (asserts! (>= (collateral-value new-collateral btc-price) min-required-collateral) ERR-UNDERCOLLATERALIZED)
+            
+            ;; Update position with reduced collateral
+            (map-set positions user {
+              collateral: new-collateral,
+              debt: current-debt,
+              last-update-block: stacks-block-height
+            })
+            
+            ;; Update global collateral tracking
+            (var-set total-collateral (- (var-get total-collateral) btc-amount))
+            
+            (ok true)
+          )
+        )
+      )
+    )
+  )
+)
